@@ -35,11 +35,11 @@ import pyrodigal
 DEFAULTS = dict(
     min_contig=5_000,
     min_plv_length=5_000,
-    max_plv_length=40_000,
+    max_plv_length=80_000,
     seed_window=30_000,
     min_families=3,
     cluster_merge_gap=8_000,
-    max_cluster_span=40_000,
+    max_cluster_span=80_000,
     edge_gap=3_000,
     gc_window=500,
     gc_flank=10_000,
@@ -48,7 +48,7 @@ DEFAULTS = dict(
     mcp_score_margin=0.0,
     flank_for_tir=50_000,
     tir_min_insert=6_000,
-    tir_max_insert=40_000,
+    tir_max_insert=80_000,
     tir_min_len=100,
     tir_max_len=8_000,
     tir_min_id=65.0,
@@ -56,20 +56,15 @@ DEFAULTS = dict(
     tir_max_kmer_frac=0.70,
     tir_max_tandem_frac=0.70,
     tir_max_tandem_period=12,
-    tir_boundary_tolerance=3_000,
-    tir_max_span_ratio=1.50,
-    overhang_min_coding_density=0.20,
-    overhang_strict_coding_density=0.35,
-    overhang_max_gc_delta=5.0,
-    overhang_strict_gc_delta=3.0,
     tsd_min=4,
-    tsd_max=12,
+    tsd_max=20,
     tsd_max_slide=2,
     max_n_fraction=0.05,
     dedup_min_reciprocal_overlap=0.50,
 )
 
 MCP_LABEL = "MCP"
+CORE3 = frozenset(("MCP", "mCP", "ATPase"))
 
 PLV_HALLMARK_ORDER = [
     "MCP", "mCP", "ATPase", "endonuc", "MTase",
@@ -221,6 +216,7 @@ class Orf:
     plv_mcp_evalue: float = float("inf")
     nonplv_mcp_bitscore: float = 0.0
     nonplv_mcp_evalue: float = float("inf")
+    nonplv_mcp_name: Optional[str] = None
     best_pfam_acc: Optional[str] = None
     best_pfam_name: Optional[str] = None
     best_pfam_bitscore: float = 0.0
@@ -589,7 +585,7 @@ def scan_nonplv_mcp(
     evalue: float,
     threads: int,
 ) -> int:
-    """Scan ORFs against the NCLDV/adenovirus MCP competitor collection."""
+    """Scan ORFs against the non-PLV MCP collection."""
     alphabet = pyhmmer.easel.Alphabet.amino()
     seqs = _digital_sequences(orfs_by_id.values(), alphabet)
     with pyhmmer.plan7.HMMFile(str(hmm_path)) as hf:
@@ -599,6 +595,7 @@ def scan_nonplv_mcp(
 
     n_hits = 0
     for top_hits in pyhmmer.hmmsearch(hmms, seqs, cpus=threads, E=evalue):
+        hmm_name, _ = _query_meta(top_hits)
         for hit in top_hits:
             if not hit.included:
                 continue
@@ -610,10 +607,11 @@ def scan_nonplv_mcp(
             if score > o.nonplv_mcp_bitscore:
                 o.nonplv_mcp_bitscore = score
                 o.nonplv_mcp_evalue = ev
+                o.nonplv_mcp_name = hmm_name
             n_hits += 1
 
     _LOG.info(
-        f"{hmm_path.name}: {n_hits:,} included competitor MCP hit(s) "
+        f"{hmm_path.name}: {n_hits:,} included non-PLV MCP hit(s) "
         f"at E-value <= {evalue:g}"
     )
     return n_hits
@@ -636,7 +634,7 @@ def classify_hallmarks(
     orfs_by_id: Dict[str, Orf],
     mcp_score_margin: float,
 ) -> Tuple[int, int, int]:
-    """Assign one primary PLV hallmark per ORF after MCP competition.
+    """Assign one primary PLV hallmark per ORF after PLV/non-PLV MCP classification.
     """
     n_mcp = n_ambiguous = n_marked = 0
     for o in orfs_by_id.values():
@@ -670,8 +668,8 @@ def classify_hallmarks(
             n_marked += 1
 
     _LOG.info(
-        f"Competitive PLV hallmark classification: MCP={n_mcp:,}; "
-        f"competitor-dominated MCP={n_ambiguous:,}; other PLV hallmark ORFs={n_marked:,}"
+        f"PLV/non-PLV MCP classification: MCP={n_mcp:,}; "
+        f"non-PLV-dominated MCP={n_ambiguous:,}; other PLV hallmark ORFs={n_marked:,}"
     )
     return n_mcp, n_ambiguous, n_marked
 
@@ -986,17 +984,27 @@ def _count_bracketed(tir: TirPair, intervals: Sequence[Tuple[int, int]]) -> int:
     return sum(1 for s, e in intervals if tir.left_start <= s and e <= tir.right_end)
 
 
+def _count_overlapping(tir: TirPair, intervals: Sequence[Tuple[int, int]]) -> int:
+    return sum(1 for s, e in intervals if s <= tir.right_end and e >= tir.left_start)
+
+
 def select_best_tir(
     pairs: List[TirPair],
     region_offset: int,
-    marker_intervals: List[Tuple[int, int]],
+    marker_records: List[Tuple[int, int, str]],
+    nonplv_intervals: List[Tuple[int, int]],
     region_seq: str,
     cfg: dict,
 ) -> Tuple[Optional[TirPair], dict]:
-    diag = dict(raw=len(pairs), pass_size=0, pass_len=0, pass_id=0, pass_complexity=0, pass_bracket=0, best_near_miss="")
-    valid: List[Tuple[int, TirPair]] = []
-    near_score = -1.0
-    required = len(marker_intervals)
+    diag = dict(
+        raw=len(pairs), pass_size=0, pass_len=0, pass_id=0,
+        pass_complexity=0, pass_bracket=0, pass_nonplv=0, best_near_miss="",
+    )
+    valid: List[Tuple[Tuple, TirPair]] = []
+    candidate_families = {family for _, _, family in marker_records}
+    core3_candidate = CORE3.issubset(candidate_families)
+    total_markers = len(marker_records)
+    near_rank: Optional[Tuple] = None
 
     for t in pairs:
         gls, gle = t.left_start + region_offset - 1, t.left_end + region_offset - 1
@@ -1012,8 +1020,19 @@ def select_best_tir(
         left_seq = region_seq[t.left_start - 1:t.left_end]
         right_seq = region_seq[t.right_start - 1:t.right_end]
         ok_complex = not (_tir_is_low_complexity(left_seq, cfg) or _tir_is_low_complexity(right_seq, cfg))
-        bracketed = _count_bracketed(abs_tir, marker_intervals)
-        ok_bracket = bracketed >= required if required else True
+
+        bracketed_records = [
+            (s, e, family) for s, e, family in marker_records
+            if abs_tir.left_start <= s and e <= abs_tir.right_end
+        ]
+        bracketed_families = {family for _, _, family in bracketed_records}
+        n_bracketed = len(bracketed_records)
+        n_families = len(bracketed_families)
+        has_mcp = MCP_LABEL in bracketed_families
+        core3_ok = (not core3_candidate) or CORE3.issubset(bracketed_families)
+        ok_bracket = has_mcp and core3_ok and n_families >= cfg["min_families"]
+        nonplv_inside = _count_overlapping(abs_tir, nonplv_intervals)
+        ok_nonplv = nonplv_inside == 0
 
         if ok_size:
             diag["pass_size"] += 1
@@ -1025,97 +1044,48 @@ def select_best_tir(
             diag["pass_complexity"] += 1
         if ok_size and ok_len and ok_id and ok_complex and ok_bracket:
             diag["pass_bracket"] += 1
+        if ok_size and ok_len and ok_id and ok_complex and ok_bracket and ok_nonplv:
+            diag["pass_nonplv"] += 1
 
-        score = 1e6 * sum((ok_size, ok_len, ok_id, ok_complex, ok_bracket)) + bracketed * 1e4 + t.tir_identity * t.tir_length
-        if score > near_score:
-            near_score = score
+        all_families = bool(candidate_families) and bracketed_families == candidate_families
+        all_markers = total_markers > 0 and n_bracketed == total_markers
+        rank = (
+            sum((ok_size, ok_len, ok_id, ok_complex, ok_bracket, ok_nonplv)),
+            int(all_families), int(all_markers), n_families, n_bracketed,
+            t.tir_identity, t.tir_length, t.score, -t.insert_size,
+        )
+        if near_rank is None or rank > near_rank:
+            near_rank = rank
             diag["best_near_miss"] = (
                 f"insert={t.insert_size:,},len={t.tir_length},id={t.tir_identity:.1f}%,"
-                f"bracket={bracketed}/{required},complex={'pass' if ok_complex else 'fail'}"
+                f"markers={n_bracketed}/{total_markers},families={n_families}/{len(candidate_families)},"
+                f"core3={'pass' if core3_ok else 'fail'},nonPLV={nonplv_inside},"
+                f"complex={'pass' if ok_complex else 'fail'}"
             )
-        if ok_size and ok_len and ok_id and ok_complex and ok_bracket:
-            valid.append((bracketed, abs_tir))
+
+        if not (ok_size and ok_len and ok_id and ok_complex and ok_bracket and ok_nonplv):
+            continue
+
+        valid_rank = (
+            int(all_families), int(all_markers), n_families, n_bracketed,
+            t.tir_identity, t.tir_length, t.score, -t.insert_size,
+        )
+        valid.append((valid_rank, abs_tir))
 
     if not valid:
         return None, diag
-    valid.sort(key=lambda x: (x[0], x[1].tir_identity, x[1].tir_length, x[1].score), reverse=True)
+    valid.sort(key=lambda x: x[0], reverse=True)
     return valid[0][1], diag
-
-def _overhang_supported(
-    contig: str,
-    start: int,
-    end: int,
-    core_gc: float,
-    contig_orfs: Sequence[Orf],
-    host_intervals: Sequence[Tuple[int, int]],
-    fa: pyfastx.Fasta,
-    genome_path: str,
-    cfg: dict,
-    strict: bool,
-) -> bool:
-    if end < start:
-        return True
-    if _span_overlaps_intervals(host_intervals, start, end):
-        return False
-    orfs = [o for o in contig_orfs if o.start <= end and o.end >= start]
-    if not orfs:
-        return False
-    marker_present = any(_is_plv_hallmark(o) for o in orfs)
-    density = _coding_density(orfs, start, end)
-    min_density = cfg["overhang_strict_coding_density"] if strict else cfg["overhang_min_coding_density"]
-    if density < min_density and not marker_present:
-        return False
-    over_gc = gc_of_seq(_fetch_seq(fa, genome_path, contig, start, end))
-    max_delta = cfg["overhang_strict_gc_delta"] if strict else cfg["overhang_max_gc_delta"]
-    if not math.isnan(core_gc) and not math.isnan(over_gc) and abs(core_gc - over_gc) > max_delta and not marker_present:
-        return False
-    return True
 
 
 def arbitrate_final_boundary(
-    contig: str,
     bio_start: int,
     bio_end: int,
     best_tir: Optional[TirPair],
-    contig_orfs: Sequence[Orf],
-    host_intervals: Sequence[Tuple[int, int]],
-    fa: pyfastx.Fasta,
-    genome_path: str,
-    cfg: dict,
 ) -> Tuple[int, int, str, Optional[TirPair], str]:
     if best_tir is None:
         return bio_start, bio_end, "marker_gc_boundary", None, "no_tir"
-
-    tol = cfg["tir_boundary_tolerance"]
-    left_diff = abs(best_tir.left_start - bio_start)
-    right_diff = abs(best_tir.right_end - bio_end)
-    if left_diff <= tol and right_diff <= tol:
-        return best_tir.left_start, best_tir.right_end, "TIR", best_tir, "boundary_compatible"
-
-    if best_tir.left_start >= bio_start and best_tir.right_end <= bio_end:
-        return bio_start, bio_end, "marker_gc_boundary", None, "internal_tir_rejected"
-
-    # Mixed inside/outside geometry is treated conservatively.
-    brackets_bio = best_tir.left_start <= bio_start and best_tir.right_end >= bio_end
-    if not brackets_bio:
-        return bio_start, bio_end, "marker_gc_boundary", None, "discordant_tir_rejected"
-
-    bio_len = max(1, bio_end - bio_start + 1)
-    tir_len = max(1, best_tir.right_end - best_tir.left_start + 1)
-    strict = (tir_len / bio_len) > cfg["tir_max_span_ratio"]
-    core_gc = gc_of_seq(_fetch_seq(fa, genome_path, contig, bio_start, bio_end))
-    left_ok = _overhang_supported(
-        contig, best_tir.left_start, bio_start - 1, core_gc, contig_orfs,
-        host_intervals, fa, genome_path, cfg, strict,
-    )
-    right_ok = _overhang_supported(
-        contig, bio_end + 1, best_tir.right_end, core_gc, contig_orfs,
-        host_intervals, fa, genome_path, cfg, strict,
-    )
-    if left_ok and right_ok:
-        return best_tir.left_start, best_tir.right_end, "TIR", best_tir, "outside_supported"
-    return bio_start, bio_end, "marker_gc_boundary", None, "overextended_tir_rejected"
-
+    return best_tir.left_start, best_tir.right_end, "TIR", best_tir, "selected_tir"
 
 def find_tsd(left_flank: str, right_flank: str, k_min: int, k_max: int, max_slide: int) -> Optional[Tsd]:
     left, right = left_flank.upper(), right_flank.upper()
@@ -1161,16 +1131,20 @@ def _process_cluster(task: dict) -> dict:
     for note in notes:
         logs.append(("info", f"Cluster {ci} {contig}:{cstart:,}-{cend:,}: {note}"))
 
-    marker_intervals = [
-        (o.start, o.end) for o in contig_orfs
-        if _is_plv_hallmark(o) and o.start >= bio_start and o.end <= bio_end
+    marker_records = [
+        (o.start, o.end, o.family) for o in contig_orfs
+        if _is_plv_hallmark(o) and o.family is not None
+        and o.start >= bio_start and o.end <= bio_end
+    ]
+    nonplv_intervals = [
+        (o.start, o.end) for o in contig_orfs if o.nonplv_mcp_bitscore > 0.0
     ]
     rstart = max(1, bio_start - cfg["flank_for_tir"])
     rend = min(clen, bio_end + cfg["flank_for_tir"])
     region_seq = _fetch_seq(fa, genome_path, contig, rstart, rend)
 
     best_tir: Optional[TirPair] = None
-    with tempfile.TemporaryDirectory(prefix="findPLV_v3_") as td:
+    with tempfile.TemporaryDirectory(prefix="findPLV_") as td:
         tdir = Path(td)
         region_fa = tdir / "region.fa"
         blast_tab = tdir / "tir.tsv"
@@ -1181,20 +1155,22 @@ def _process_cluster(task: dict) -> dict:
         try:
             run_blastn_self(region_fa, blast_tab)
             pairs = parse_blastn_tabular(blast_tab)
-            best_tir, diag = select_best_tir(pairs, rstart, marker_intervals, region_seq, cfg)
+            best_tir, diag = select_best_tir(
+                pairs, rstart, marker_records, nonplv_intervals, region_seq, cfg,
+            )
             if best_tir is None:
                 logs.append((
                     "info",
                     f"Cluster {ci}: no accepted TIR [raw={diag['raw']},size={diag['pass_size']},"
                     f"len={diag['pass_len']},id={diag['pass_id']},complex={diag['pass_complexity']},"
-                    f"bracket={diag['pass_bracket']}; near={diag['best_near_miss'] or 'none'}]",
+                    f"bracket={diag['pass_bracket']},nonPLV={diag['pass_nonplv']}; "
+                    f"near={diag['best_near_miss'] or 'none'}]",
                 ))
         except (OSError, subprocess.CalledProcessError) as exc:
             logs.append(("warning", f"Cluster {ci}: BLASTN TIR search failed ({exc}); continuing TIR-less"))
 
     final_start, final_end, boundary_method, tir_for_output, tir_status = arbitrate_final_boundary(
-        contig, bio_start, bio_end, best_tir, contig_orfs, host_intervals,
-        fa, genome_path, cfg,
+        bio_start, bio_end, best_tir,
     )
     logs.append((
         "info",
@@ -1207,7 +1183,6 @@ def _process_cluster(task: dict) -> dict:
         return dict(status="skip", cluster_index=ci, log_msgs=logs,
                     message=f"Cluster {ci}: final length {length:,} bp outside {cfg['min_plv_length']:,}-{cfg['max_plv_length']:,} bp")
 
-    # When GFF is supplied, a final PLV must not overlap any host annotation span.
     if host_intervals and _span_overlaps_intervals(host_intervals, final_start, final_end):
         return dict(status="skip", cluster_index=ci, log_msgs=logs,
                     message=f"Cluster {ci}: final PLV span overlaps host GFF annotation; discarded")
@@ -1216,13 +1191,32 @@ def _process_cluster(task: dict) -> dict:
         [o for o in contig_orfs if o.start >= final_start and o.end <= final_end],
         key=lambda o: o.start,
     )
+    nonplv_inside = [
+        o for o in contig_orfs
+        if o.nonplv_mcp_bitscore > 0.0 and o.start <= final_end and o.end >= final_start
+    ]
+    if nonplv_inside:
+        detail = ", ".join(
+            f"{o.nonplv_mcp_name or 'nonPLV_MCP'}@{o.start:,}-{o.end:,}"
+            for o in nonplv_inside[:5]
+        )
+        if len(nonplv_inside) > 5:
+            detail += f", +{len(nonplv_inside) - 5} more"
+        return dict(status="skip", cluster_index=ci, log_msgs=logs,
+                    message=f"Cluster {ci}: non-PLV MCP detected inside final PLV boundary ({detail}); discarded")
+
     fams = sorted({o.family for o in plv_orfs if _is_plv_hallmark(o)}, key=_natural_key)
     if MCP_LABEL not in fams:
         return dict(status="skip", cluster_index=ci, log_msgs=logs,
-                    message=f"Cluster {ci}: no competitively classified PLV MCP inside final boundary")
+                    message=f"Cluster {ci}: no PLV-classified MCP inside final boundary")
     if len(fams) < cfg["min_families"]:
         return dict(status="skip", cluster_index=ci, log_msgs=logs,
                     message=f"Cluster {ci}: only {len(fams)} PLV marker families remain inside final boundary")
+
+    has_core3 = CORE3.issubset(set(fams))
+    if not has_core3 and tir_for_output is None:
+        return dict(status="skip", cluster_index=ci, log_msgs=logs,
+                    message=f"Cluster {ci}: lacks CORE3 (MCP,mCP,ATPase) and has no accepted TIR; discarded")
 
     seq = _fetch_seq(fa, genome_path, contig, final_start, final_end)
     n_fraction = seq.upper().count("N") / len(seq) if seq else 1.0
@@ -1232,8 +1226,14 @@ def _process_cluster(task: dict) -> dict:
 
     tsd = None
     if tir_for_output is not None:
-        left_flank = _fetch_seq(fa, genome_path, contig, max(1, tir_for_output.left_start - 50), tir_for_output.left_start - 1) if tir_for_output.left_start > 1 else ""
-        right_flank = _fetch_seq(fa, genome_path, contig, tir_for_output.right_end + 1, min(clen, tir_for_output.right_end + 50)) if tir_for_output.right_end < clen else ""
+        left_flank = _fetch_seq(
+            fa, genome_path, contig, max(1, tir_for_output.left_start - 50),
+            tir_for_output.left_start - 1,
+        ) if tir_for_output.left_start > 1 else ""
+        right_flank = _fetch_seq(
+            fa, genome_path, contig, tir_for_output.right_end + 1,
+            min(clen, tir_for_output.right_end + 50),
+        ) if tir_for_output.right_end < clen else ""
         tsd = find_tsd(left_flank, right_flank, cfg["tsd_min"], cfg["tsd_max"], cfg["tsd_max_slide"])
 
     mcp_best = max((o.plv_mcp_bitscore for o in plv_orfs if o.family == MCP_LABEL), default=0.0)
@@ -1255,7 +1255,7 @@ def deduplicate_plvs(plvs: List[Plv], min_reciprocal_overlap: float) -> List[Plv
         return plvs
     ranked = sorted(
         plvs,
-        key=lambda p: (p.has_tir, p.n_families, p.mcp_best_bitscore, -p.length),
+        key=lambda p: (CORE3.issubset(set(p.families_present)), p.has_tir, p.n_families, p.mcp_best_bitscore, -p.length),
         reverse=True,
     )
     kept: List[Plv] = []
@@ -1289,15 +1289,10 @@ def _tsd_status(tsd: Optional[Tsd]) -> str:
 
 def _tir_fields(tir: Optional[TirPair]) -> dict:
     if tir is None:
-        return dict(
-            tir_length="NA", tir_score="NA",
-            tir_identity_pct="NA", tir_gaps="NA",
-        )
+        return dict(tir_length="NA", tir_identity_pct="NA")
     return dict(
         tir_length=tir.tir_length,
-        tir_score=f"{tir.score:.1f}",
         tir_identity_pct=f"{tir.tir_identity:.2f}",
-        tir_gaps=tir.gaps,
     )
 
 
@@ -1305,13 +1300,12 @@ def _tsd_fields(tsd: Optional[Tsd]) -> dict:
     if tsd is None:
         return dict(
             tsd_len="NA", tsd_left="NA", tsd_right="NA",
-            tsd_mismatch="NA", tsd_conservation="NODETECT",
+            tsd_conservation="NODETECT",
         )
     return dict(
         tsd_len=tsd.length,
         tsd_left=tsd.sequence_left,
         tsd_right=tsd.sequence_right,
-        tsd_mismatch=tsd.mismatches,
         tsd_conservation=_tsd_status(tsd),
     )
 
@@ -1325,6 +1319,8 @@ def calculate_confidence(p: Plv) -> Tuple[int, str]:
     score = 50
     supporting = len([f for f in p.families_present if f != MCP_LABEL])
     score += min(supporting, 3) * 10
+    if CORE3.issubset(set(p.families_present)):
+        score = max(score, 85)
     if p.has_tir:
         score += 15
     if p.tsd is not None:
@@ -1343,17 +1339,15 @@ def calculate_confidence(p: Plv) -> Tuple[int, str]:
 def write_summary_tsv(plvs: List[Plv], path: Path) -> None:
     columns = [
         "contig_id", "plv_name", "start", "end", "plv_length", "gc",
-        "total_cds", "n_hallmark_families", "hallmarks", "mcp_bitscore",
-        "confidence_score", "confidence", "has_tir",
-        "tir_length", "tir_score", "tir_identity_pct", "tir_gaps",
-        "tsd_len", "tsd_left", "tsd_right", "tsd_mismatch",
-        "tsd_conservation", "boundary_method",
+        "total_cds", "n_hallmark_families", "hallmarks", "confidence",
+        "has_tir", "tir_length", "tir_identity_pct",
+        "tsd_len", "tsd_left", "tsd_right", "tsd_conservation",
     ]
     with open(path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         for p in sorted(plvs, key=lambda x: _natural_key(x.plv_id)):
-            confidence_score, confidence = calculate_confidence(p)
+            _, confidence = calculate_confidence(p)
             row = dict(
                 contig_id=p.contig,
                 plv_name=p.plv_id,
@@ -1364,11 +1358,8 @@ def write_summary_tsv(plvs: List[Plv], path: Path) -> None:
                 total_cds=len(p.orfs),
                 n_hallmark_families=p.n_families,
                 hallmarks=",".join(p.families_present),
-                mcp_bitscore=f"{p.mcp_best_bitscore:.1f}",
-                confidence_score=confidence_score,
                 confidence=confidence,
                 has_tir="yes" if p.has_tir else "no",
-                boundary_method=p.boundary_method,
             )
             row.update(_tir_fields(p.tir))
             row.update(_tsd_fields(p.tsd))
@@ -1589,6 +1580,8 @@ def log_result_summary(plvs: List[Plv], genome_path: Path) -> None:
     _LOG.info(f"  Without TIR: {len(plvs) - n_tir} ({100 * (len(plvs) - n_tir) / len(plvs):.1f}%)")
     lengths = [p.length for p in plvs]
     _LOG.info(f"PLV length: min={min(lengths):,}; max={max(lengths):,}; mean={sum(lengths) / len(lengths):,.0f} bp")
+    n_core3 = sum(CORE3.issubset(set(p.families_present)) for p in plvs)
+    _LOG.info(f"CORE3 (MCP+mCP+ATPase): {n_core3} ({100 * n_core3 / len(plvs):.1f}%)")
     confidence_counts = Counter(calculate_confidence(p)[1] for p in plvs)
     _LOG.info("Confidence: " + ", ".join(f"{k}={confidence_counts[k]}" for k in ("HIGH", "MEDIUM", "LOW") if confidence_counts[k]))
     fams = Counter(f for p in plvs for f in p.families_present)
@@ -1631,7 +1624,7 @@ class _Parser(argparse.ArgumentParser):
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = _Parser(prog="findPLV_v3.py", add_help=False)
+    p = _Parser(prog="findPLV.py", add_help=False)
     p.add_argument("-h", "--help", action="help")
     p.add_argument("genome", type=Path)
     p.add_argument("-db", "--db", type=Path, required=True)
@@ -1659,7 +1652,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     t0 = time.time()
 
     _LOG.info(
-        f"findPLV_v3 started | prefix='{args.prefix}' | threads={args.threads} | "
+        f"findPLV started | prefix='{args.prefix}' | threads={args.threads} | "
         f"parallel={parallel} | genome={args.genome}"
     )
     _LOG.info(
@@ -1717,7 +1710,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if n_mcp == 0:
-        _write_no_plv_notice(args.outdir, "No competitively classified PLV MCP was detected")
+        _write_no_plv_notice(args.outdir, "No PLV-classified MCP was detected")
         log_result_summary([], args.genome)
         return 0
 
@@ -1782,8 +1775,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 plvs.append(p)
                 _LOG.info(
                     f"Cluster {res['cluster_index']} accepted | {p.contig}:{p.start:,}-{p.end:,} | "
-                    f"{p.length:,} bp | markers={p.n_families} | boundary={p.boundary_method} | "
-                    f"TIR={'yes' if p.has_tir else 'no'} | TSD={_tsd_status(p.tsd)}"
+                    f"{p.length:,} bp | markers={p.n_families} | CORE3={'yes' if CORE3.issubset(set(p.families_present)) else 'no'} | "
+                    f"boundary={p.boundary_method} | TIR={'yes' if p.has_tir else 'no'} | TSD={_tsd_status(p.tsd)}"
                 )
             else:
                 _LOG.warning(res.get("message", f"Cluster {res.get('cluster_index', '?')} discarded"))
@@ -1829,7 +1822,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _LOG.output(f"GFF3          -> {gff_path}")
     _LOG.output(f"Marker FASTAs -> {args.outdir / 'marker'} ({len(marker_paths)} file(s))")
     _LOG.output(f"Run log       -> {args.outdir / 'run.log'}")
-    _LOG.info(f"findPLV_v3 completed in {time.time() - t0:.1f} s")
+    _LOG.info(f"findPLV completed in {time.time() - t0:.1f} s")
     return 0
 
 
