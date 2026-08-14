@@ -37,7 +37,7 @@ DEFAULTS = dict(
     min_plv_length=5_000,
     max_plv_length=80_000,
     seed_window=30_000,
-    min_families=3,
+    min_families=2,
     cluster_merge_gap=8_000,
     max_cluster_span=80_000,
     edge_gap=3_000,
@@ -84,10 +84,7 @@ findPLV.py - Identify Polinton-Like Viruses (PLVs) in eukaryotic genome assembli
 Usage: findPLV.py -db <directory> --prefix <prefix> <genome.fa> [OPTIONS]
 
 Mandatory:
-  -db, --db            Database directory containing:
-                         PLV_hallmarks.hmm
-                         MCP_nonPLV.hmm
-                         Pfam-A.hmm
+  -db, --db            Database directory.
   --prefix             Output prefix for PLV IDs and files
   genome               Input eukaryotic genome assembly FASTA (gzip accepted)
 
