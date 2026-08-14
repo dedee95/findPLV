@@ -74,10 +74,10 @@ A successful run produces a directory similar to:
 ```
 Result_20260814/
 ├── Chlrein.summary.tsv  # Main PLV ouput summary table
-├── Chlrein.func.tsv     # ORF-level annotations for every retained PLV.
+├── Chlrein.func.tsv     # ORF-level annotations for every retained PLV
 ├── Chlrein.markerout    # A compact coordinate table containing PLVs and their genomic features
 ├── Chlrein.plv.fna      # FASTA file containing the nucleotide sequence of every predicted PLV
-├── Chlrein.plv.pep      # FASTA file containing all proteins predicted inside the retained PLVs.
+├── Chlrein.plv.pep      # FASTA file containing all proteins predicted inside the retained PLVs
 ├── Chlrein.plv.cds      # FASTA file containing the nucleotide CDS sequence for every ORF in the predicted PLVs
 ├── Chlrein.plv.gff3     # GFF3 annotation containing the complete predicted PLV
 ├── run.log              # Output log information
@@ -88,3 +88,27 @@ Result_20260814/
 ``` 
 
 ## How it works
+1. `findPLV` predicts protein-coding ORFs from each eligible genome contig using Pyrodigal.
+2. All predicted proteins are scanned against `PLV_hallmarks.hmm` to identify PLV hallmark genes, with major capsid protein (MCP) required for PLV detection.
+3. MCP-like proteins are also scanned against `MCP_nonPLV.hmm`; MCPs with stronger non-PLV evidence are excluded from PLV classification.
+4. Nearby PLV hallmark genes are grouped into candidate regions. At least two distinct hallmark families, including MCP, are required.
+5. Candidates containing the conserved MCP + mCP + ATPase combination are recognized as CORE3 PLV candidates.
+6. Candidate boundaries are provisionally refined using hallmark positions, nearby ORFs, and local GC composition.
+7. We search each candidate region for terminal inverted repeats (TIRs) using self-BLASTN. We select the best TIR pair by prioritizing retention of as many PLV hallmarks as possible.
+8. If a valid TIR is found, it defines the final PLV boundary, and we search the flanking sequences for 4–20 bp target-site duplications (TSDs). If no TIR is found, only CORE3 candidates are retained.
+9. Final candidates are filtered for PLV size, hallmark content, sequence quality, non-PLV MCP contamination, and optional host-GFF overlap.
+
+The PLV_hallmarks.hmm file contains several conserved PLV hallmark genes collected from previously published studies: [Yutin et al. 2015](https://link.springer.com/article/10.1186/s12915-015-0207-4); [Bellas & Sommaruga 2021](https://link.springer.com/article/10.1186/s40168-020-00956-0); [Bellas et al. 2023](https://www.pnas.org/doi/10.1073/pnas.2300465120); [Bulzu et al. 2025](https://link.springer.com/article/10.1186/s40168-025-02148-0); [Bellas & Sommaruga 2026](https://www.biorxiv.org/content/biorxiv/early/2026/06/19/2026.06.19.733378.full.pdf)
+
+```
+1. pPolB: protein primed DNA polymerase
+2. MCP: major capsid protein
+3. mCP: minor capsid protein
+4. ATPase: DNA packaging A32-like ATPase
+5. YR: Tyrosine recombinase
+6. RVE: retroviral integrasse
+7. MTase: DNA methyltransferase
+8. Tlr6FP: tetrahymena thermophila protein
+9. Tet: Tet-like diocygenase
+10. Endonuc: endonuclease
+```
