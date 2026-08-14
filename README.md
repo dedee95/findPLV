@@ -98,7 +98,8 @@ Result_20260814/
 8. If a valid TIR is found, it defines the final PLV boundary, and we search the flanking sequences for 4–20 bp target-site duplications (TSDs). If no TIR is found, only CORE3 candidates are retained.
 9. Final candidates are filtered for PLV size, hallmark content, sequence quality, non-PLV MCP contamination, and optional host-GFF overlap.
 
-The PLV_hallmarks.hmm file contains several conserved PLV hallmark genes collected from previously published studies: [Yutin et al. 2015](https://link.springer.com/article/10.1186/s12915-015-0207-4); [Bellas & Sommaruga 2021](https://link.springer.com/article/10.1186/s40168-020-00956-0); [Bellas et al. 2023](https://www.pnas.org/doi/10.1073/pnas.2300465120); [Bulzu et al. 2025](https://link.springer.com/article/10.1186/s40168-025-02148-0); [Bellas & Sommaruga 2026](https://www.biorxiv.org/content/biorxiv/early/2026/06/19/2026.06.19.733378.full.pdf)
+The `PLV_hallmarks.hmm` file contains several conserved PLV hallmark genes collected from previously published studies: [Yutin et al. 2015](https://link.springer.com/article/10.1186/s12915-015-0207-4); [Bellas & Sommaruga 2021](https://link.springer.com/article/10.1186/s40168-020-00956-0); [Bellas et al. 2023](https://www.pnas.org/doi/10.1073/pnas.2300465120); [Bulzu et al. 2025](https://link.springer.com/article/10.1186/s40168-025-02148-0); [Bellas & Sommaruga 2026](https://www.biorxiv.org/content/biorxiv/early/2026/06/19/2026.06.19.733378.full.pdf)
+
 
 ```
 1. pPolB: protein primed DNA polymerase
